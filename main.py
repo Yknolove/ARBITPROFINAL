@@ -3,27 +3,31 @@ import logging
 import asyncio
 import ccxt.async_support as ccxt
 from aiogram import Bot, Dispatcher, types
-from aiogram.utils.executor import start_polling
+from aiogram.utils.executor import start_webhook
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiohttp import web
 
-# Configure logging
+# Логирование
 logging.basicConfig(level=logging.INFO)
 
-# Environment variables
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# Переменные окружения
+BOT_TOKEN   = os.getenv("BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://your-app.onrender.com/webhook
+WEBHOOK_PATH= "/webhook"
+PORT        = int(os.getenv("PORT", 8443))  # Render default порт для Web Services
 
-# Initialize bot and dispatcher
+# Инициализация бота и диспетчера
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
+dp  = Dispatcher(bot)
 
-# In-memory user settings
+# Настройки пользователей (in-memory)
 user_settings = {}
 
-# CCXT async exchange classes mapping
+# Карта бирж для CCXT
 exchange_classes = {
     'binance': ccxt.binance,
-    'bybit': ccxt.bybit,
-    'bitget': ccxt.bitget
+    'bybit':   ccxt.bybit,
+    'bitget':  ccxt.bitget
 }
 
 async def init_exchange_clients():
@@ -33,11 +37,11 @@ async def init_exchange_clients():
     return clients
 
 async def close_exchange_clients(clients):
-    for client in clients.values():
+    for c in clients.values():
         try:
-            await client.close()
-        except Exception as e:
-            logging.warning(f"Error closing client: {e}")
+            await c.close()
+        except:
+            pass
 
 async def arbitrage_task():
     clients = await init_exchange_clients()
@@ -46,16 +50,12 @@ async def arbitrage_task():
             if not user_settings:
                 await asyncio.sleep(60)
                 continue
-            for user_id, settings in user_settings.items():
-                exch = settings['exchange']
-                buy_rate = settings['buy_rate']
-                sell_rate = settings['sell_rate']
-                max_vol = settings['max_volume']
+            for uid, s in user_settings.items():
+                exch, buy, sell, vol = s['exchange'], s['buy_rate'], s['sell_rate'], s['max_volume']
                 try:
-                    ticker_buy = await clients[exch].fetch_ticker('USDT/UAH')
-                    ask = ticker_buy.get('ask')
-                except Exception as e:
-                    logging.error(f"Error fetching ticker on {exch}: {e}")
+                    tick = await clients[exch].fetch_ticker('USDT/UAH')
+                    ask = tick.get('ask')
+                except:
                     continue
                 if ask is None:
                     continue
@@ -63,88 +63,100 @@ async def arbitrage_task():
                     if other == exch:
                         continue
                     try:
-                        ticker_sell = await client.fetch_ticker('USDT/UAH')
-                        bid = ticker_sell.get('bid')
-                    except Exception as e:
-                        logging.error(f"Error fetching ticker on {other}: {e}")
+                        t2 = await client.fetch_ticker('USDT/UAH')
+                        bid = t2.get('bid')
+                    except:
                         continue
                     if bid is None:
                         continue
-                    if ask <= buy_rate and bid >= sell_rate:
-                        profit = (bid - ask) * max_vol
+                    if ask <= buy and bid >= sell:
+                        profit = (bid - ask) * vol
                         text = (
-                            f"🔔 *Arbitrage opportunity!*\n"
-                            f"Купить на {exch.capitalize()} по {ask} UAH/USDT\n"
-                            f"Продать на {other.capitalize()} по {bid} UAH/USDT\n"
-                            f"Объем: {max_vol} USDT\n"
+                            f"🔔 *Arbitrage opportunity!*\\n"
+                            f"Купить на {exch.capitalize()} по {ask} UAH/USDT\\n"
+                            f"Продать на {other.capitalize()} по {bid} UAH/USDT\\n"
+                            f"Объем: {vol} USDT\\n"
                             f"Прибыль: {profit:.2f} UAH"
                         )
                         urls = {
                             'binance': 'https://p2p.binance.com/ru/trade/USDT?fiat=UAH',
-                            'bybit': 'https://www.bybit.com/ru-ua/c2c',
-                            'bitget': 'https://www.bitget.com/ru/p2p/USDT'
+                            'bybit':   'https://www.bybit.com/ru-ua/c2c',
+                            'bitget':  'https://www.bitget.com/ru/p2p/USDT'
                         }
                         markup = InlineKeyboardMarkup().add(
-                            InlineKeyboardButton("Открыть P2P", url=urls.get(other))
+                            InlineKeyboardButton("Открыть P2P", url=urls[other])
                         )
-                        await bot.send_message(chat_id=user_id, text=text, parse_mode='Markdown', reply_markup=markup)
+                        await bot.send_message(uid, text, parse_mode='Markdown', reply_markup=markup)
             await asyncio.sleep(60)
     finally:
         await close_exchange_clients(clients)
 
+# /start и меню
 @dp.message_handler(commands=['start'])
-async def cmd_start(message: types.Message):
-    text = (
+async def cmd_start(msg: types.Message):
+    await msg.reply(
         "🤖 *Добро пожаловать в ArbitPRO!* 🤖\n\n"
-        "Этот бот уведомляет об арбитражных возможностях между биржами Binance, Bybit и Bitget.\n\n"
         "Команды:\n"
-        "/set_filters <exchange> <buy_rate> <sell_rate> - установить фильтр\n"
+        "/set_filters <exchange> <buy_rate> <sell_rate> — установить фильтр\n"
         "Пример: /set_filters Binance 41.20 42.50\n"
-        "/my_settings - показать текущие настройки"
+        "/my_settings — показать настройки",
+        parse_mode='Markdown'
     )
-    await message.reply(text, parse_mode='Markdown')
 
 @dp.message_handler(commands=['set_filters'])
-async def set_filters(message: types.Message):
-    args = message.text.split()
-    if len(args) != 4:
-        return await message.reply("Использование: /set_filters <exchange> <buy_rate> <sell_rate>")
-    name = args[1].lower()
+async def set_filters(msg: types.Message):
+    parts = msg.text.split()
+    if len(parts) != 4:
+        return await msg.reply("Использование: /set_filters <exchange> <buy_rate> <sell_rate>")
+    name = parts[1].lower()
     if name not in exchange_classes:
-        return await message.reply("Доступные: Binance, Bybit, Bitget")
+        return await msg.reply("Доступные: Binance, Bybit, Bitget")
     try:
-        buy_rate = float(args[2])
-        sell_rate = float(args[3])
+        b, s = float(parts[2]), float(parts[3])
     except:
-        return await message.reply("Неправильный формат. Пример: /set_filters Binance 41.20 42.50")
-    user_settings[message.from_user.id] = {
-        'exchange': name,
-        'buy_rate': buy_rate,
-        'sell_rate': sell_rate,
+        return await msg.reply("Неверный формат чисел. Пример: /set_filters Binance 41.20 42.50")
+    user_settings[msg.from_user.id] = {
+        'exchange':   name,
+        'buy_rate':   b,
+        'sell_rate':  s,
         'max_volume': 100.0
     }
-    await message.reply(f"Фильтр: {name.capitalize()}, buy≤{buy_rate}, sell≥{sell_rate}, max $100")
+    await msg.reply(f"Фильтр: {name.capitalize()}, buy≤{b}, sell≥{s}, max=100 USDT")
 
 @dp.message_handler(commands=['my_settings'])
-async def my_settings(message: types.Message):
-    s = user_settings.get(message.from_user.id)
+async def my_settings(msg: types.Message):
+    s = user_settings.get(msg.from_user.id)
     if not s:
-        return await message.reply("Фильтр не установлен. /set_filters")
-    await message.reply(f"Биржа: {s['exchange'].capitalize()}, buy≤{s['buy_rate']}, sell≥{s['sell_rate']}, max${s['max_volume']}")
+        return await msg.reply("Вы ещё не установили фильтр. /set_filters")
+    await msg.reply(
+        f"Биржа: {s['exchange'].capitalize()}, buy≤{s['buy_rate']}, sell≥{s['sell_rate']}, max={s['max_volume']}",
+        parse_mode='Markdown'
+    )
 
+# Health-check для Render
+async def handle_root(request):
+    return web.Response(text="OK")
+web_app = web.Application()
+web_app.router.add_get("/", handle_root)
+
+# Запуск webhook
 async def on_startup(dp):
-    logging.info("Starting arbitrage task...")
-    # Удаляем старые накопленные апдейты и вебхук
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-    except:
-        pass
+    logging.info("Setting webhook…")
+    await bot.set_webhook(WEBHOOK_URL)
     asyncio.create_task(arbitrage_task())
 
 async def on_shutdown(dp):
-    logging.info("Shutting down...")
+    logging.info("Deleting webhook and closing…")
+    await bot.delete_webhook()
     await bot.close()
 
 if __name__ == '__main__':
-    logging.info("Запуск polling режима")
-    start_polling(dp, skip_updates=True, on_startup=on_startup, on_shutdown=on_shutdown)
+    start_webhook(
+        dispatcher=dp,
+        webhook_path=WEBHOOK_PATH,
+        on_startup=on_startup,
+        on_shutdown=on_shutdown,
+        host='0.0.0.0',
+        port=PORT,
+        web_app=web_app
+    )
